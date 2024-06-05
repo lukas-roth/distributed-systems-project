@@ -20,14 +20,16 @@ class ChatServer:
     def __init__(self):
         self.client_multicast_address = config.get('SHARED', 'ClientGroupMulticastAddress')
         self.client_multicast_port = config.getint('SHARED', 'ClientGroupMulticasPort')
+        self.server_multicast_address = config.get('SHARED', 'ServerClientGroupMulticastAddress') #eigentlich "ServerGroupMulticastAddress"??
+        self.server_multicast_port = config.getint('SHARED', 'ServerGroupMulticasPort')
         self.server_port = 5001  # Example port for clients to connect
+
         self.clients = []
         self.message_queue = queue.Queue()
         self.running = True
         self.last_100_messages = deque(maxlen=100)
-        self.server_multicast_address = config.get('SHARED', 'ServerClientGroupMulticastAddress') #eigentlich "ServerGroupMulticastAddress"??
-        self.server_multicast_port = config.getint('SHARED', 'ServerGroupMulticasPort')
-        self.heartbeat = config.getint('SERVER','Heartbeat')
+        self.heartbeat_intervall = config.getint('SERVER','HeartbeatInvervall')
+        self.timeout_multiplier = config.getint('SERVER','TimeoutMultiplier')
         
 
 
@@ -95,17 +97,17 @@ class ChatServer:
         announce_thread.join()
         consumer_thread.join()
     
-    def sendHeartbeat(self):
+    def send_heartbeat(self):
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as sock:
             ttl = struct.pack('b', 1)
             sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, ttl)
             while self.running:
                 message = self.last_100_messages
                 sock.sendto(message.encode('utf-8'), (self.server_multicast_address, self.server_multicast_port))
-                logger.info(f"Leader sent heartbeat: {message}")
-                time.sleep(self.heartbeat)
+                logger.debug(f"Leader sent heartbeat: {message}")
+                time.sleep(self.heartbeat_intervall)
 
-    def listenHeartbeat(self):
+    def listen_for_heartbeat(self):
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as sock:
             # Set socket options to join the multicast group
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -118,12 +120,12 @@ class ChatServer:
 
             while self.running:
                 try:
-                    sock.settimeout(self.heartbeat * 2)
+                    sock.settimeout(self.heartbeat_intervall * self.timeout_multiplier)
                     data, addr = sock.recvfrom(1024)
                     last_heartbeat = time.time()
-                    logger.info(f"Received heartbeat from {addr}: {data.decode('utf-8')}")
+                    logger.debug(f"Received heartbeat from {addr}: {data.decode('utf-8')}")
                 except socket.timeout:
-                    if time.time() - last_heartbeat > self.heartbeat * 2:
+                    if (time.time() - last_heartbeat) > (self.heartbeat_intervall * self.timeout_multiplier):
                         logger.warning("Heartbeat timeout. Initiating bully election.")
                         self.bullyElection()
                         break
