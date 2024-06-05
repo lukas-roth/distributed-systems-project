@@ -1,4 +1,5 @@
 from collections import deque
+import json
 import socket
 import struct
 import threading
@@ -7,6 +8,7 @@ import logging
 import logging.config
 import configparser
 import time
+from multicast_listener import MulticastListener
 
 # Load logging configuration
 logging.config.fileConfig('logging.conf', defaults={'logfilename': 'server.log'})
@@ -17,7 +19,8 @@ config = configparser.ConfigParser()
 config.read('config.cfg')
 
 class ChatServer:
-    def __init__(self):
+    def __init__(self, is_replica = False):
+        self.is_replica = is_replica
         self.client_multicast_address = config.get('SHARED', 'ClientGroupMulticastAddress')
         self.client_multicast_port = config.getint('SHARED', 'ClientGroupMulticasPort')
         self.server_multicast_address = config.get('SHARED', 'ServerClientGroupMulticastAddress') #eigentlich "ServerGroupMulticastAddress"??
@@ -28,10 +31,9 @@ class ChatServer:
         self.message_queue = queue.Queue()
         self.running = True
         self.last_100_messages = deque(maxlen=100)
-        self.heartbeat_intervall = config.getint('SERVER','HeartbeatInvervall')
+        self.heartbeat_intervall = config.getint('SERVER','HeartbeatIntverval')
         self.timeout_multiplier = config.getint('SERVER','TimeoutMultiplier')
         
-
 
     def announce(self):
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as sock:
@@ -80,58 +82,59 @@ class ChatServer:
                 except Exception as e:
                     logger.error(f"Error sending message to client {client}: {e}")
 
-
-    def run(self):
-        # Start the announcement thread
-        announce_thread = threading.Thread(target=self.announce)
-        announce_thread.start()
-
-        # Start the consumer thread
-        consumer_thread = threading.Thread(target=self.consumer)
-        consumer_thread.start()
-
-        # Start handling client messages
-        self.handle_client()
-
-        # Join threads when stopping
-        announce_thread.join()
-        consumer_thread.join()
-    
     def send_heartbeat(self):
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as sock:
             ttl = struct.pack('b', 1)
             sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, ttl)
             while self.running:
-                message = self.last_100_messages
+                message = json.dumps(list(self.last_100_messages))
                 sock.sendto(message.encode('utf-8'), (self.server_multicast_address, self.server_multicast_port))
-                logger.debug(f"Leader sent heartbeat: {message}")
+                logger.info(f"Leader sent heartbeat: {message}")
                 time.sleep(self.heartbeat_intervall)
 
-    def listen_for_heartbeat(self):
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as sock:
-            # Set socket options to join the multicast group
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.bind(('', self.server_multicast_port))
+    def listen_for_heartbeat(self, data):
+        if isinstance(data, socket.timeout):
+            logger.warning("Heartbeat timeout! Initiating bully election.")
+            # self.trigger_bully_election()
+        else:
+            logger.info(f"Received heartbeat: {data}")
+            self.last_100_messages = deque(json.loads(data))
 
-            mreq = struct.pack('4sl', socket.inet_aton(self.server_multicast_address), socket.INADDR_ANY)
-            sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+    def run(self):
+        if self.is_replica: 
+            logger.debug('Am repilca, assuming duties.')
+            # Listen for heatbeats and server data
+            hearbeat_timeout = self.heartbeat_intervall * self.timeout_multiplier
+            heartbeat_listener = MulticastListener(self.server_multicast_address, self.server_multicast_port, self.listen_for_heartbeat, logger, True, hearbeat_timeout)
+            heartbeat_listener.start()
+        else:
+            logger.debug('Am chat server, assuming duties.')
+            # Start the hearbeat announcement thread
+            heartbeat_thread = threading.Thread(target=self.send_heartbeat)
+            heartbeat_thread.start()
 
-            last_heartbeat = time.time()
+            # Start the client announcement thread
+            announce_thread = threading.Thread(target=self.announce)
+            announce_thread.start()
 
-            while self.running:
-                try:
-                    sock.settimeout(self.heartbeat_intervall * self.timeout_multiplier)
-                    data, addr = sock.recvfrom(1024)
-                    last_heartbeat = time.time()
-                    logger.debug(f"Received heartbeat from {addr}: {data.decode('utf-8')}")
-                except socket.timeout:
-                    if (time.time() - last_heartbeat) > (self.heartbeat_intervall * self.timeout_multiplier):
-                        logger.warning("Heartbeat timeout. Initiating bully election.")
-                        self.bullyElection()
-                        break
-                except Exception as e:
-                    logger.error(f"Error receiving heartbeat: {e}")
+            # Start the consumer thread
+            consumer_thread = threading.Thread(target=self.consumer)
+            consumer_thread.start()
+
+            # Start handling client messages
+            self.handle_client()
+
+            # Join threads when stopping
+            announce_thread.join()
+            consumer_thread.join()
+            heartbeat_thread.join()
+
+    
+
+            
 
 if __name__ == "__main__":
-    server = ChatServer()
+    import sys
+    is_replica = sys.argv[1] if len(sys.argv) > 1 else False
+    server = ChatServer(is_replica)
     server.run()

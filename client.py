@@ -1,13 +1,12 @@
 import random
 import socket
-import struct
-import threading
 import queue
 import logging
 import logging.config
 import configparser
 import time
 import json
+from multicast_listener import MulticastListener
 
 # Load configuration
 config = configparser.ConfigParser()
@@ -31,27 +30,6 @@ class ChatClient:
         logging.config.fileConfig('logging.conf', defaults={'logfilename': log_filename})
         self.logger = logging.getLogger()
         self.logger.debug(f"Client ID:{self.client_id}")
-        
-    class MulticastListener(threading.Thread):
-        def __init__(self, mutlicast_address, port, handler, logger):
-            threading.Thread.__init__(self)
-            self.group = mutlicast_address
-            self.port = port
-            self.handler = handler
-            self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self.sock.bind(('', self.port))
-            
-            mreq = struct.pack("4sl", socket.inet_aton(self.group), socket.INADDR_ANY)
-            self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
-            self.logger = logger
-
-        def run(self):
-            while True:
-                data, addr = self.sock.recvfrom(1024)
-                if data:
-                    #self.logger.debug(f"Received data from {addr}")
-                    self.handler(data.decode('utf-8'))
     
     def load_responses(self, filepath):
         with open(filepath, 'r', encoding='utf-8') as file:
@@ -97,7 +75,7 @@ class ChatClient:
         self.message_queue.put(message)
     
     def start_multicast_listener(self):
-        listener = self.MulticastListener(self.client_group_multicast_address, self.client_group_multicast_port, self.handle_server_message, self.logger)
+        listener = MulticastListener(self.client_group_multicast_address, self.client_group_multicast_port, self.handle_server_message, self.logger)
         listener.start()
 
     def run(self):
