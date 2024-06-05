@@ -18,13 +18,18 @@ config.read('config.cfg')
 
 class ChatServer:
     def __init__(self):
-        self.server_multicast_address = config.get('SHARED', 'ClientGroupMulticastAddress')
-        self.server_multicast_port = config.getint('SHARED', 'ClientGroupMulticasPort')
+        self.client_multicast_address = config.get('SHARED', 'ClientGroupMulticastAddress')
+        self.client_multicast_port = config.getint('SHARED', 'ClientGroupMulticasPort')
         self.server_port = 5001  # Example port for clients to connect
         self.clients = []
         self.message_queue = queue.Queue()
         self.running = True
         self.last_100_messages = deque(maxlen=100)
+        self.server_multicast_address = config.get('SHARED', 'ServerClientGroupMulticastAddress') #eigentlich "ServerGroupMulticastAddress"??
+        self.server_multicast_port = config.getint('SHARED', 'ServerGroupMulticasPort')
+        self.heartbeat = config.getint('SERVER','Heartbeat')
+        
+
 
     def announce(self):
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as sock:
@@ -32,7 +37,7 @@ class ChatServer:
             sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, ttl)
             while self.running:
                 message = f"{socket.gethostbyname(socket.gethostname())}:{self.server_port}"
-                sock.sendto(message.encode('utf-8'), (self.server_multicast_address, self.server_multicast_port))
+                sock.sendto(message.encode('utf-8'), (self.client_multicast_address, self.client_multicast_port))
                 logger.info(f"Announced server at {message}")
                 time.sleep(5)  # Announce every 5 seconds
 
@@ -89,6 +94,41 @@ class ChatServer:
         # Join threads when stopping
         announce_thread.join()
         consumer_thread.join()
+    
+    def sendHeartbeat(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as sock:
+            ttl = struct.pack('b', 1)
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, ttl)
+            while self.running:
+                message = self.last_100_messages
+                sock.sendto(message.encode('utf-8'), (self.server_multicast_address, self.server_multicast_port))
+                logger.info(f"Leader sent heartbeat: {message}")
+                time.sleep(self.heartbeat)
+
+    def listenHeartbeat(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as sock:
+            # Set socket options to join the multicast group
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(('', self.server_multicast_port))
+
+            mreq = struct.pack('4sl', socket.inet_aton(self.server_multicast_address), socket.INADDR_ANY)
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+
+            last_heartbeat = time.time()
+
+            while self.running:
+                try:
+                    sock.settimeout(self.heartbeat * 2)
+                    data, addr = sock.recvfrom(1024)
+                    last_heartbeat = time.time()
+                    logger.info(f"Received heartbeat from {addr}: {data.decode('utf-8')}")
+                except socket.timeout:
+                    if time.time() - last_heartbeat > self.heartbeat * 2:
+                        logger.warning("Heartbeat timeout. Initiating bully election.")
+                        self.bullyElection()
+                        break
+                except Exception as e:
+                    logger.error(f"Error receiving heartbeat: {e}")
 
 if __name__ == "__main__":
     server = ChatServer()
