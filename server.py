@@ -1,5 +1,5 @@
 from collections import deque
-import datetime
+from datetime import datetime, timezone
 import json
 import socket
 import struct
@@ -25,6 +25,8 @@ class ChatServer:
         self.client_multicast_port = config.getint('SHARED', 'ClientGroupMulticasPort')
         self.server_multicast_address = config.get('SHARED', 'ServerClientGroupMulticastAddress') #eigentlich "ServerGroupMulticastAddress"??
         self.server_multicast_port = config.getint('SHARED', 'ServerGroupMulticasPort')
+        self.uid_multicast_address = config.get('SERVER', 'UidGroupMulticastAddress') 
+        self.uid_multicast_port = config.getint('SERVER', 'UidGroupMulticasPort')
         self.server_port = 5001  # Example port for clients to connect
 
         self.clients = []
@@ -34,7 +36,10 @@ class ChatServer:
         self.heartbeat_intervall = config.getint('SERVER','HeartbeatIntverval')
         self.timeout_multiplier = config.getint('SERVER','TimeoutMultiplier')
         self.uuid = uuid.uuid4()
-        self.uid = self.combine_timestamp_uuid('1970-01-01T00:00:00Z')
+        self.uid = self.combine_timestamp_uuid("1970-01-01T00:00:00+00:00")
+
+        self.replica_uids = {}
+        self.election_ongoing = False
 
         # Load logging configuration
         logging.config.fileConfig('logging.conf', defaults={'logfilename': f'server-{self.uuid}.log'})
@@ -93,11 +98,36 @@ class ChatServer:
             ttl = struct.pack('b', 1)
             sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, ttl)
             while self.running:
-                message = json.dumps({"data":list(self.last_100_messages), "time":datetime.datetime.now().isoformat()})
+                message = json.dumps({"data":list(self.last_100_messages), "time":datetime.now().isoformat()})
                 sock.sendto(message.encode('utf-8'), (self.server_multicast_address, self.server_multicast_port))
                 self.logger.info(f"Leader sent heartbeat: {message}")
                 time.sleep(self.heartbeat_intervall)
-
+    
+    def send_uid_update(self, old_uid, new_uid):
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as sock:
+            ttl = struct.pack('b', 1)
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, ttl)
+            hostname = socket.gethostname()
+            ip_address = socket.gethostbyname(hostname)
+            message = json.dumps({"old_uid": old_uid, "new_uid": new_uid, "address": ip_address})
+            sock.sendto(message.encode('utf-8'), (self.uid_multicast_address, self.uid_multicast_port))
+            self.logger.info(f"Multicasted uid change: {message}")
+            
+    def listen_for_uid_update(self, data): 
+        data = json.loads(data)
+        new_uid = str(data["new_uid"])
+        old_uid = str(data["old_uid"])
+        address = data["address"]
+       
+        if str(self.uid) != new_uid:
+            self.logger.info(f"Received uid update: {data}")
+            if old_uid in self.replica_uids:
+                self.replica_uids[new_uid] = self.replica_uids.pop(old_uid)
+            else:
+                self.replica_uids[new_uid] = address
+            self.logger.debug(f"Current list of replica uids: {self.replica_uids}")
+        
+            
     def listen_for_heartbeat(self, data):
         if isinstance(data, socket.timeout):
             self.logger.warning("Heartbeat timeout! Initiating bully election.")
@@ -107,21 +137,26 @@ class ChatServer:
             self.last_100_messages = deque(json.loads(data)["data"])
             time = json.loads(data)["time"]
             self.logger.debug(f"Time heartbeat: {time}")
-            self.uuid = self.combine_timestamp_uuid(time)
+            old_uid = self.uid
+            new_uid = self.combine_timestamp_uuid(time)
+            self.uid = new_uid
+            self.send_uid_update(old_uid,new_uid)
+            
     
     def timestamp_to_int(self,timestamp):
         """
         Convert a timestamp to an integer representing milliseconds since the epoch.
         """
         dt = datetime.fromisoformat(timestamp)
-        epoch = datetime(1970, 1, 1)
+        dt = dt.replace(tzinfo=timezone.utc)
+        epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
         return int((dt - epoch).total_seconds() * 1000)
 
     def uuid_to_int(self,server_uuid):
         """
         Convert a UUID to an integer.
         """
-        return uuid.UUID(server_uuid).int
+        return uuid.UUID(str(server_uuid)).int
 
     def combine_timestamp_uuid(self,timestamp):
         """
@@ -135,7 +170,10 @@ class ChatServer:
         return combined_int
 
     def run(self):
-        
+
+        uid_listener =  heartbeat_listener = MulticastListener(self.uid_multicast_address, self.uid_multicast_port, self.listen_for_uid_update, self.logger)
+        uid_listener.start()
+
         if self.is_replica: 
             self.logger.debug('Am repilca, assuming duties.')
             # Listen for heatbeats and server data
