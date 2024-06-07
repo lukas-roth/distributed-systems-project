@@ -50,20 +50,22 @@ class ChatClient:
                 return random.choice(event['comments'])
         return None
     
-    def process_messages(self, messages, sock, server_ip, server_port):
+    def process_messages(self, messages):
         for index, message in enumerate(messages.split('\n')):
+            username, content = message.split(':', 1)
             if (index < 10) and message not in self.received_messages: 
                 self.received_messages.append(message)
                 self.update_chat()
             
-            if self.message_count >= 20:
-                if random.random() < 0.55:
-                    response = f"{self.username}: {self.find_new_event(messages)}"
-                    sock.sendto(response.encode('utf-8'), (server_ip, server_port))
-                    self.logger.info(f"Sent response: {response}")
-                self.message_count = 0            
-            else:
-                username, content = message.split(':', 1)
+            
+                if self.message_count >= 5:
+                    response = None
+                    if random.random() < 0.55:
+                        response = self.find_new_event(messages)
+                    self.message_count = 0  
+                    if response:
+                        return response          
+                
                 if username != self.username:
                     response = self.find_response(content)
                     if response:
@@ -82,11 +84,7 @@ class ChatClient:
         stdscr.clear()
         
         # Draw the static part of the interface
-        stdscr.addstr(0, 0, f"Chat View ({self.client_id})")
-        row = 11
-        if row < height:
-            for col in range(width):
-                stdscr.addch(row, col, '-')
+        stdscr.addstr(0, 0, f"Chat View ({self.client_id}: {self.username})")
         stdscr.refresh()
     
     def update_chat(self):
@@ -122,7 +120,7 @@ class ChatClient:
     
     def find_new_event(self, message):
         events = []
-        if message is not None:
+        if message:
             for event in self.responses:
                 if event['event'] not in message:
                     events.append(event['event'])
@@ -130,8 +128,8 @@ class ChatClient:
             # If message is None, include all events
             for event in self.responses:
                 events.append(event['event'])
-        
-        return random.choice(events) if events else None
+        self.logger.debug(f"Selecting from the following events: {events}")
+        return random.choice(events) if events else "Goal by Germany!"
 
     def handle_server_message(self, message):
         self.logger.info(f"Received message on multicast address {self.client_group_multicast_address}:{self.client_group_multicast_port} : '{message}'")
@@ -181,10 +179,12 @@ class ChatClient:
                         self.logger.debug(f"Received data from {addr, data}")
                         chat_message = data.decode('utf-8')
                         self.message_count += 1
-                        response = self.process_messages(chat_message, sock, server_ip, server_port)
-                        if response:
+                        response = self.process_messages(chat_message)
+                        if response is not None:
                             response = f"{self.username}: {response}"
                             time.sleep(random.randint(1, self.wait_time_before_message))
+                            self.received_messages.append(response)
+                            self.update_chat()
                             sock.sendto(response.encode('utf-8'), (server_ip, server_port))
                             self.logger.info(f"Sent response: {response}")
 
@@ -193,12 +193,13 @@ class ChatClient:
                     key = self.stdscr.getch()
                     if key == 26:  # ASCII value for Ctrl+Z
                         self.logger.info("Exiting client.")
-                        return
+                        exit()
+                        
 
             except socket.error as e:
                 self.logger.error(f"Socket error: {e}")
-            except Exception as e:
-                self.logger.error(f"An error occurred: {e}")
+            #except Exception as e:
+                #self.logger.error(f"An error occurred: {e}")
 
 if __name__ == "__main__":
     import sys

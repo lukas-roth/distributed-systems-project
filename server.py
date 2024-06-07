@@ -1,6 +1,7 @@
 from collections import deque
 from datetime import datetime, timezone
 import json
+import random
 import socket
 import struct
 import threading
@@ -32,7 +33,7 @@ class ChatServer:
         self.clients = []
         self.message_queue = queue.Queue()
         self.running = True
-        self.last_100_messages = deque(maxlen=100)
+        self.last_100_messages = deque(maxlen=20)
         self.heartbeat_intervall = config.getint('SERVER','HeartbeatIntverval')
         self.timeout_multiplier = config.getint('SERVER','TimeoutMultiplier')
         self.uuid = uuid.uuid4()
@@ -47,6 +48,8 @@ class ChatServer:
         self.logger = logging.getLogger('serverLogger')
         self.logger.info(f"Has uuid of {self.uuid}.")
 
+        self.heartbeat_listener = None
+
     def announce(self):
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as sock:
             ttl = struct.pack('b', 1)
@@ -54,7 +57,7 @@ class ChatServer:
             while self.running:
                 message = f"{socket.gethostbyname(socket.gethostname())}:{self.server_port}"
                 sock.sendto(message.encode('utf-8'), (self.client_multicast_address, self.client_multicast_port))
-                self.logger.info(f"Announced server at {message}")
+                self.logger.debug(f"Announced server at {message}")
                 time.sleep(5)  # Announce every 5 seconds
 
     def handle_client(self):
@@ -68,7 +71,7 @@ class ChatServer:
                         self.clients.append(addr)
                     if data:
                         message = data.decode('utf-8')
-                        self.logger.info(f"Received message from {addr}: {message}")
+                        self.logger.debug(f"Received message from {addr}: {message}")
                         self.message_queue.put((message, addr))
                 except Exception as e:
                     self.logger.error(f"Error handling client message: {e}")
@@ -96,7 +99,7 @@ class ChatServer:
         while self.running:
             try:
                 message, addr = self.message_queue.get(timeout=1)
-                self.logger.info(f"Processing message: {message}")
+                self.logger.debug(f"Processing message: {message}")
                 self.last_100_messages.append(message)
                 self.broadcast(self.last_100_messages, addr)
             except queue.Empty:
@@ -106,11 +109,13 @@ class ChatServer:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
             messages_str = "\n".join(reversed(messages))  # Convert the deque of messages to a single string
             for client in self.clients:
-                try:
-                    sock.sendto(messages_str.encode('utf-8'), client)
-                    self.logger.info(f"Sent message to client {client}: {messages_str}")
-                except Exception as e:
-                    self.logger.error(f"Error sending message to client {client}: {e}")
+                if client != exclude_addr:
+                    try:
+                        sock.sendto(messages_str.encode('utf-8'), client)
+                        self.logger.debug(f"Exclude {exclude_addr}")
+                        self.logger.debug(f"Sent message to client {client}: {messages_str}")
+                    except Exception as e:
+                        self.logger.error(f"Error sending message to client {client}: {e}")
 
     def send_heartbeat(self):
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as sock:
@@ -119,7 +124,7 @@ class ChatServer:
             while self.running:
                 message = json.dumps({"data":list(self.last_100_messages), "time":datetime.now().isoformat()})
                 sock.sendto(message.encode('utf-8'), (self.server_multicast_address, self.server_multicast_port))
-                self.logger.info(f"Leader sent heartbeat: {message}")
+                self.logger.debug(f"Leader sent heartbeat: {message}")
                 time.sleep(self.heartbeat_intervall)
     
     def send_uid_update(self, old_uid, new_uid):
@@ -130,7 +135,7 @@ class ChatServer:
             ip_address = socket.gethostbyname(hostname)
             message = json.dumps({"old_uid": old_uid, "new_uid": new_uid, "address": f"{ip_address}:{self.election_port}"})
             sock.sendto(message.encode('utf-8'), (self.uid_multicast_address, self.uid_multicast_port))
-            self.logger.info(f"Multicasted uid change: {message}")
+            self.logger.debug(f"Multicasted uid change: {message}")
             
     def listen_for_uid_update(self, data): 
         data = json.loads(data)
@@ -139,7 +144,7 @@ class ChatServer:
         address = data["address"]
        
         if str(self.uid) != new_uid:
-            self.logger.info(f"Received uid update: {data}")
+            self.logger.debug(f"Received uid update: {data}")
             if old_uid in self.replica_uids:
                 self.replica_uids[new_uid] = self.replica_uids.pop(old_uid)
             else:
@@ -152,7 +157,7 @@ class ChatServer:
             self.logger.warning("Heartbeat timeout! Initiating bully election.")
             self.initiate_election()
         else:
-            self.logger.info(f"Received heartbeat: {data}")
+            self.logger.debug(f"Received heartbeat: {data}")
             self.last_100_messages = deque(json.loads(data)["data"])
             time = json.loads(data)["time"]
             self.logger.debug(f"Time heartbeat: {time}")
@@ -160,7 +165,18 @@ class ChatServer:
             new_uid = self.combine_timestamp_uuid(time)
             self.uid = new_uid
             self.send_uid_update(old_uid,new_uid)
-            
+
+    def listen_for_initial_heartbeat(self, data):
+        if isinstance(data, socket.timeout):
+            self.logger.warning("No inital server heartbeat! Initiating bully election.")
+            self.initiate_election()
+        else:
+            self.logger.debug(f"Received intial heartbeat. There's already a server")
+            self.logger.info('Am repilca, assuming duties.')
+            self.heartbeat_listener.stop()
+            hearbeat_timeout = self.heartbeat_intervall * self.timeout_multiplier
+            self.heartbeat_listener = MulticastListener(self.server_multicast_address, self.server_multicast_port, self.listen_for_heartbeat, self.logger, True, hearbeat_timeout)
+            self.heartbeat_listener.start()
     
     def timestamp_to_int(self,timestamp):
         """
@@ -193,7 +209,7 @@ class ChatServer:
             self.election_ongoing = True
             self.logger.info(f"Server {self.uid} is initiating an election")
             for uid in self.replica_uids:
-                if uid > self.uid:
+                if int(uid) > self.uid:
                     self.send_election_message(uid)
 
             # Wait for responses
@@ -209,31 +225,31 @@ class ChatServer:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
             message = f"ELECTION:{self.uid}"
             target_address, target_port = self.replica_uids[target_uid].split(":")
-            sock.sendto(message.encode('utf-8'), (target_address, target_port))
+            sock.sendto(message.encode('utf-8'), (target_address, int(target_port)))
             self.logger.info(f"Server {self.uid} sent ELECTION message to server {target_uid}")
 
     def send_ok_message(self, target_uid):
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
             message = f"OK:{self.uid}"
             target_address, target_port = self.replica_uids[target_uid].split(":")
-            sock.sendto(message.encode('utf-8'), (target_address, target_port))
+            sock.sendto(message.encode('utf-8'), (target_address, int(target_port)))
             self.logger.info(f"Server {self.uid} sent OK message to Server {target_uid}")
 
     def send_coordinator_message(self):
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
             message = f"COORDINATOR:{self.uid}"
             for uid in self.replica_uids:
-                if uid != self.uid:
+                if uid != str(self.uid):
                     target_address, target_port = self.replica_uids[uid].split(":")
-                    sock.sendto(message.encode('utf-8'), (target_address, target_port))
+                    sock.sendto(message.encode('utf-8'), (target_address, int(target_port)))
                     self.logger.info(f"Server {self.uid} sent COORDINATOR message to Server {uid}")    
 
     def handle_election_message(self, message, addr):
         sender_uid = int(message.split(":")[1])
-        if sender_uid > self.uid:
+        if int(sender_uid) > self.uid:
             self.logger.info(f"Server {self.uid} received ELECTION message from Server {sender_uid} and is conceding")
             self.send_ok_message(sender_uid)
-        elif sender_uid < self.uid:
+        elif int(sender_uid) < self.uid:
             self.logger.info(f"Server {self.uid} received ELECTION message from Server {sender_uid} and is initiating own election")
             self.initiate_election()
 
@@ -250,30 +266,30 @@ class ChatServer:
     def run(self):
         uid_listener = MulticastListener(self.uid_multicast_address, self.uid_multicast_port, self.listen_for_uid_update, self.logger)
         uid_listener.start()
+        self.send_uid_update(self.uid,self.uid)
 
         election_handler = threading.Thread(target=self.handle_election)
         election_handler.start()
     
-        self.logger.debug('Am repilca, assuming duties.')
         # Listen for heatbeats and server data
-        hearbeat_timeout = self.heartbeat_intervall * self.timeout_multiplier
-        heartbeat_listener = MulticastListener(self.server_multicast_address, self.server_multicast_port, self.listen_for_heartbeat, self.logger, True, hearbeat_timeout)
-        heartbeat_listener.start()
+        hearbeat_timeout = random.randint(10,30)
+        self.heartbeat_listener = MulticastListener(self.server_multicast_address, self.server_multicast_port, self.listen_for_initial_heartbeat, self.logger, True, hearbeat_timeout)
+        self.heartbeat_listener.start()
         
             
     def become_chat_server(self):
-        self.logger.debug('Am chat server, assuming duties.')
+        self.logger.info('Am chat server, assuming duties.')
         # Start the hearbeat announcement thread
         heartbeat_thread = threading.Thread(target=self.send_heartbeat)
         heartbeat_thread.start()
 
-        # Start the client announcement thread
-        announce_thread = threading.Thread(target=self.announce)
-        announce_thread.start()
-
         # Start the consumer thread
         consumer_thread = threading.Thread(target=self.consumer)
         consumer_thread.start()
+
+        # Start the client announcement thread
+        announce_thread = threading.Thread(target=self.announce)
+        announce_thread.start()
 
         # Start handling client messages
         self.handle_client()
