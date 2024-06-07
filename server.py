@@ -44,7 +44,7 @@ class ChatServer:
 
         # Load logging configuration
         logging.config.fileConfig('logging.conf', defaults={'logfilename': f'server-{self.uuid}.log'})
-        self.logger = logging.getLogger()
+        self.logger = logging.getLogger('serverLogger')
         self.logger.info(f"Has uuid of {self.uuid}.")
 
     def announce(self):

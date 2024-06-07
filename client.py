@@ -28,7 +28,7 @@ class ChatClient:
         # Load logging configuration with dynamic log file name
         log_filename = f'client_{self.client_id}.log'
         logging.config.fileConfig('logging.conf', defaults={'logfilename': log_filename})
-        self.logger = logging.getLogger()
+        self.logger = logging.getLogger('clientLogger')
         self.logger.debug(f"Client ID:{self.client_id}")
     
     def load_responses(self, filepath):
