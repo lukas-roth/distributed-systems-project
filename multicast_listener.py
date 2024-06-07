@@ -25,7 +25,7 @@ class MulticastListener(threading.Thread):
     def run(self):
         while self.running:
             try:
-                data, addr = self.sock.recvfrom(1024)
+                data, addr = self.sock.recvfrom(1024*65)
                 if data:
                     self.logger.debug(f"Received data from {addr}")
                     self.handler(data.decode('utf-8'))

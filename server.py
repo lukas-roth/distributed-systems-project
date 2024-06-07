@@ -63,7 +63,7 @@ class ChatServer:
             self.logger.info(f"Client handler listening on port {self.server_port}")
             while self.running:
                 try:
-                    data, addr = server_sock.recvfrom(1024)
+                    data, addr = server_sock.recvfrom(1024*65)
                     if addr not in self.clients:
                         self.clients.append(addr)
                     if data:
