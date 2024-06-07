@@ -23,8 +23,8 @@ class ChatServer:
         self.is_replica = is_replica
         self.client_multicast_address = config.get('SHARED', 'ClientGroupMulticastAddress')
         self.client_multicast_port = config.getint('SHARED', 'ClientGroupMulticasPort')
-        self.server_multicast_address = config.get('SHARED', 'ServerClientGroupMulticastAddress') #eigentlich "ServerGroupMulticastAddress"??
-        self.server_multicast_port = config.getint('SHARED', 'ServerGroupMulticasPort')
+        self.server_multicast_address = config.get('SERVER', 'ServerGroupMulticastAddress') #eigentlich "ServerGroupMulticastAddress"??
+        self.server_multicast_port = config.getint('SERVER', 'ServerGroupMulticasPort')
         self.uid_multicast_address = config.get('SERVER', 'UidGroupMulticastAddress') 
         self.uid_multicast_port = config.getint('SERVER', 'UidGroupMulticasPort')
         self.server_port = 5001  # Example port for clients to connect
