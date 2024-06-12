@@ -28,6 +28,7 @@ class ChatClient:
         self.current_server = None
         self.client_id = client_id
         self.received_messages = deque(maxlen=10)
+        self.server_connection_lost = False
 
         # Load logging configuration with dynamic log file name
         log_filename = f'client_{self.client_id}.log'
@@ -92,6 +93,7 @@ class ChatClient:
         curses.start_color()
         curses.init_pair(1, curses.COLOR_GREEN, curses.COLOR_BLACK)
         curses.init_pair(2, curses.COLOR_MAGENTA, curses.COLOR_BLACK)
+        curses.init_pair(3, curses.COLOR_RED, curses.COLOR_BLACK)
 
         # Define column widths
         username_width = 18
@@ -106,6 +108,8 @@ class ChatClient:
             # Display username with color
             if username == self.username:
                 self.stdscr.addstr(index, 0, formatted_username, curses.color_pair(2))
+            elif "Info" in username or "Warning" in username:
+                self.stdscr.addstr(index, 0, formatted_username, curses.color_pair(3))
             else:
                 self.stdscr.addstr(index, 0, formatted_username, curses.color_pair(1))
 
@@ -151,13 +155,14 @@ class ChatClient:
             try:
                 advertised_server = self.message_queue.get(timeout=1)  # Adjust timeout as necessary
                 
-                if (self.current_server != advertised_server):
+                if (self.current_server != advertised_server or self.server_connection_lost):
                     self.current_server = advertised_server 
                     server_ip, server_port = advertised_server.split(':')
                     server_port = int(server_port)
                     # Establish socket connection here
                     time.sleep(random.randint(1, self.wait_time_before_connect))  # Wait before connecting
                     self.connect_to_server(server_ip, server_port)
+                    
             except queue.Empty:
                 # Check for user input
                 self.stdscr.nodelay(True)
@@ -169,16 +174,23 @@ class ChatClient:
     def connect_to_server(self, server_ip, server_port):
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
             self.logger.info(f"Connected to server at {server_ip}:{server_port}")
+            
             try:
                 msg = f"{self.username}: {self.find_new_event(None)}"
                 sock.sendto(msg.encode('utf-8'), (server_ip, server_port))
                 self.logger.info(f"Sent response: {msg}")
+                
                 while True:
                     data, addr = sock.recvfrom(1024*65)
                     if data:
                         self.logger.debug(f"Received data from {addr, data}")
                         chat_message = data.decode('utf-8')
                         self.message_count += 1
+
+                        if self.server_connection_lost:
+                            self.received_messages.append("Info: Connection to server established")
+                            self.server_connection_lost = False
+
                         response = self.process_messages(chat_message)
                         if response is not None:
                             response = f"{self.username}: {response}"
@@ -198,6 +210,9 @@ class ChatClient:
 
             except socket.error as e:
                 self.logger.error(f"Socket error: {e}")
+                self.server_connection_lost = True
+                self.received_messages.append("Warning!: Connection to server lost")
+                self.update_chat()
             #except Exception as e:
                 #self.logger.error(f"An error occurred: {e}")
 

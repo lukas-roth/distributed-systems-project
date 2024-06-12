@@ -87,7 +87,7 @@ class ChatServer:
                     if data:
                         message = data.decode('utf-8')
                         if message.startswith("ELECTION:"):
-                            self.handle_election_message(message, addr)
+                            self.handle_election_message(message)
                         elif message.startswith("OK:"):
                             self.handle_ok_message()
                         elif message.startswith("COORDINATOR:"):
@@ -133,7 +133,7 @@ class ChatServer:
             sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, ttl)
             hostname = socket.gethostname()
             ip_address = socket.gethostbyname(hostname)
-            message = json.dumps({"old_uid": old_uid, "new_uid": new_uid, "address": f"{ip_address}:{self.election_port}"})
+            message = json.dumps({"old_uid": old_uid, "new_uid": new_uid, "address": f"{ip_address}:{self.election_port}", "id": str(self.uuid)})
             sock.sendto(message.encode('utf-8'), (self.uid_multicast_address, self.uid_multicast_port))
             self.logger.debug(f"Multicasted uid change: {message}")
             
@@ -142,19 +142,22 @@ class ChatServer:
         new_uid = str(data["new_uid"])
         old_uid = str(data["old_uid"])
         address = data["address"]
+        id = data["id"]
        
         if str(self.uid) != new_uid:
             self.logger.debug(f"Received uid update: {data}")
             if old_uid in self.replica_uids:
-                self.replica_uids[new_uid] = self.replica_uids.pop(old_uid)
+                self.replica_uids.pop(old_uid)
+                self.replica_uids[new_uid] = {"address" :address, "id": id}
             else:
-                self.replica_uids[new_uid] = address
+                self.replica_uids[new_uid] = {"address" :address, "id": id}
             self.logger.debug(f"Current list of replica uids: {self.replica_uids}")
         
             
     def listen_for_heartbeat(self, data):
         if isinstance(data, socket.timeout):
             self.logger.warning("Heartbeat timeout! Initiating bully election.")
+            self.heartbeat_listener.stop()
             self.initiate_election()
         else:
             self.logger.debug(f"Received heartbeat: {data}")
@@ -169,6 +172,7 @@ class ChatServer:
     def listen_for_initial_heartbeat(self, data):
         if isinstance(data, socket.timeout):
             self.logger.warning("No inital server heartbeat! Initiating bully election.")
+            self.heartbeat_listener.stop()
             self.initiate_election()
         else:
             self.logger.debug(f"Received intial heartbeat. There's already a server")
@@ -207,16 +211,18 @@ class ChatServer:
     def initiate_election(self):
         if not self.election_ongoing:
             self.election_ongoing = True
-            self.logger.info(f"Server {self.uid} is initiating an election")
+            self.logger.info(f"Server {self.uuid} is initiating an election")
             for uid in self.replica_uids:
+                self.logger.debug(f"Initiate election: {uid}, self: {self.uid}, result{int(uid) > self.uid}")
                 if int(uid) > self.uid:
                     self.send_election_message(uid)
 
             # Wait for responses
+            self.logger.debug(f"Will wait: {self.election_wait_time}")
             time.sleep(self.election_wait_time)
             if self.election_ongoing:
                 self.send_coordinator_message()
-                self.logger.info(f"Server {self.uid} is elected as the new leader")
+                self.logger.info(f"Server {self.uuid} is elected as the new leader")
                 self.election_ongoing = False
                 self.become_chat_server()
                 #todo stop current replica duties 
@@ -224,43 +230,48 @@ class ChatServer:
     def send_election_message(self, target_uid):
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
             message = f"ELECTION:{self.uid}"
-            target_address, target_port = self.replica_uids[target_uid].split(":")
+            target_address, target_port = self.replica_uids[target_uid]["address"].split(":")
             sock.sendto(message.encode('utf-8'), (target_address, int(target_port)))
-            self.logger.info(f"Server {self.uid} sent ELECTION message to server {target_uid}")
+            self.logger.info(f"Server {self.uuid} sent ELECTION message to server {self.replica_uids[target_uid]["id"]}")
 
     def send_ok_message(self, target_uid):
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
             message = f"OK:{self.uid}"
-            target_address, target_port = self.replica_uids[target_uid].split(":")
+            target_address, target_port = self.replica_uids[target_uid]["address"].split(":")
             sock.sendto(message.encode('utf-8'), (target_address, int(target_port)))
-            self.logger.info(f"Server {self.uid} sent OK message to Server {target_uid}")
+            self.logger.info(f"Server {self.uuid} sent OK message to Server {self.replica_uids[target_uid]["id"]}")
 
     def send_coordinator_message(self):
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
             message = f"COORDINATOR:{self.uid}"
             for uid in self.replica_uids:
                 if uid != str(self.uid):
-                    target_address, target_port = self.replica_uids[uid].split(":")
+                    target_address, target_port = self.replica_uids[uid]["address"].split(":")
                     sock.sendto(message.encode('utf-8'), (target_address, int(target_port)))
-                    self.logger.info(f"Server {self.uid} sent COORDINATOR message to Server {uid}")    
+                    self.logger.info(f"Server {self.uuid} sent COORDINATOR message to Server {self.replica_uids[uid]["id"]}")    
 
-    def handle_election_message(self, message, addr):
-        sender_uid = int(message.split(":")[1])
+    def handle_election_message(self, message):
+        sender_uid = message.split(":")[1]
         if int(sender_uid) > self.uid:
-            self.logger.info(f"Server {self.uid} received ELECTION message from Server {sender_uid} and is conceding")
+            self.logger.info(f"Server {self.uuid} received ELECTION message from Server {self.replica_uids[sender_uid]["id"]} and is conceding")
             self.send_ok_message(sender_uid)
         elif int(sender_uid) < self.uid:
-            self.logger.info(f"Server {self.uid} received ELECTION message from Server {sender_uid} and is initiating own election")
+            self.logger.info(f"Server {self.uuid} received ELECTION message from Server {self.replica_uids[sender_uid]["id"]} and is initiating own election")
+            self.send_ok_message(sender_uid)
             self.initiate_election()
 
     def handle_ok_message(self):
-        self.logger.info(f"Server {self.uid} received OK message and is waiting for new coordinator")
+        self.logger.info(f"Server {self.uuid} received OK message and is waiting for new coordinator")
         self.election_ongoing = False
 
     def handle_coordinator_message(self, message):
-        new_leader_id = int(message.split(":")[1])
-        self.logger.info(f"Server {self.uid} received COORDINATOR message. New leader is Server {new_leader_id}")
+        new_leader_id = message.split(":")[1]
+        self.logger.info(f"Server {self.uuid} received COORDINATOR message. New leader is Server {self.replica_uids[new_leader_id]["id"]}")
         self.election_ongoing = False
+        self.logger.info(f"Staying replica.")
+        hearbeat_timeout = self.heartbeat_intervall * self.timeout_multiplier
+        self.heartbeat_listener = MulticastListener(self.server_multicast_address, self.server_multicast_port, self.listen_for_heartbeat, self.logger, True, hearbeat_timeout)
+        self.heartbeat_listener.start()
 
 
     def run(self):
@@ -272,7 +283,8 @@ class ChatServer:
         election_handler.start()
     
         # Listen for heatbeats and server data
-        hearbeat_timeout = random.randint(10,30)
+        hearbeat_timeout = self.heartbeat_intervall * self.timeout_multiplier
+        hearbeat_timeout = random.randint(hearbeat_timeout,hearbeat_timeout*2)
         self.heartbeat_listener = MulticastListener(self.server_multicast_address, self.server_multicast_port, self.listen_for_initial_heartbeat, self.logger, True, hearbeat_timeout)
         self.heartbeat_listener.start()
         
