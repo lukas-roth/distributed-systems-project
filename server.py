@@ -1,5 +1,6 @@
 from collections import deque
 from datetime import datetime, timezone
+import hashlib
 import json
 import random
 import socket
@@ -36,6 +37,7 @@ class ChatServer:
         self.last_100_messages = deque(maxlen=20)
         self.heartbeat_intervall = config.getint('SERVER','HeartbeatInterval')
         self.timeout_multiplier = config.getint('SERVER','TimeoutMultiplier')
+        self.hearbeat_timeout = self.heartbeat_intervall * self.timeout_multiplier
         self.uuid = uuid.uuid4()
         self.uid = self.combine_timestamp_uuid("1970-01-01T00:00:00+00:00")
 
@@ -45,6 +47,7 @@ class ChatServer:
         self.election_round = 0
 
         self.election_wait_time = config.getint('SERVER', 'ElectionWait')
+        self.stop_uid_cast_thread = threading.Event()
 
         # Load logging configuration
         logging.config.fileConfig('logging.conf', defaults={'logfilename': f'server-{self.uuid}.log'})
@@ -139,6 +142,18 @@ class ChatServer:
             message = json.dumps({"old_uid": old_uid, "new_uid": new_uid, "address": f"{ip_address}:{self.election_port}", "id": str(self.uuid)})
             sock.sendto(message.encode('utf-8'), (self.uid_multicast_address, self.uid_multicast_port))
             self.logger.debug(f"Multicasted uid change: {message}")
+    
+    def constant_uid_update(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as sock:
+            ttl = struct.pack('b', 1)
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, ttl)
+            while not self.stop_uid_cast_thread.is_set():
+                hostname = socket.gethostname()
+                ip_address = socket.gethostbyname(hostname)
+                message = json.dumps({"old_uid": self.uid, "new_uid": self.uid, "address": f"{ip_address}:{self.election_port}", "id": str(self.uuid)})
+                sock.sendto(message.encode('utf-8'), (self.uid_multicast_address, self.uid_multicast_port))
+                self.logger.debug(f"Initial multicasted uid change: {message}")
+                time.sleep(0.5)
             
     def listen_for_uid_update(self, data): 
         data = json.loads(data)
@@ -181,8 +196,7 @@ class ChatServer:
             self.logger.debug(f"Received intial heartbeat. There's already a server")
             self.logger.info('Am repilca, assuming duties.')
             self.heartbeat_listener.stop()
-            hearbeat_timeout = self.heartbeat_intervall * self.timeout_multiplier
-            self.heartbeat_listener = MulticastListener(self.server_multicast_address, self.server_multicast_port, self.listen_for_heartbeat, self.logger, True, hearbeat_timeout)
+            self.heartbeat_listener = MulticastListener(self.server_multicast_address, self.server_multicast_port, self.listen_for_heartbeat, self.logger, True, self.hearbeat_timeout)
             self.heartbeat_listener.start()
     
     def timestamp_to_int(self,timestamp):
@@ -281,24 +295,30 @@ class ChatServer:
         new_leader_id = message.split(":")[1]
         self.logger.info(f"Server {self.uuid} received COORDINATOR message. New leader is Server {self.replica_uids[new_leader_id]["id"]}")
         self.logger.info(f"Staying replica.")
-        hearbeat_timeout = self.heartbeat_intervall * self.timeout_multiplier
-        self.heartbeat_listener = MulticastListener(self.server_multicast_address, self.server_multicast_port, self.listen_for_heartbeat, self.logger, True, hearbeat_timeout)
+        self.heartbeat_listener = MulticastListener(self.server_multicast_address, self.server_multicast_port, self.listen_for_heartbeat, self.logger, True, self.hearbeat_timeout)
         self.heartbeat_listener.start()
 
 
     def run(self):
         uid_listener = MulticastListener(self.uid_multicast_address, self.uid_multicast_port, self.listen_for_uid_update, self.logger)
         uid_listener.start()
-        self.send_uid_update(self.uid,self.uid)
 
+        uid_cast_thread = threading.Thread(target=self.constant_uid_update)
+        uid_cast_thread.start()
+        
         election_handler = threading.Thread(target=self.handle_election)
         election_handler.start()
     
         # Listen for heatbeats and server data
-        hearbeat_timeout = self.heartbeat_intervall * self.timeout_multiplier
-        hearbeat_timeout = random.randint(hearbeat_timeout,hearbeat_timeout*2)
-        self.heartbeat_listener = MulticastListener(self.server_multicast_address, self.server_multicast_port, self.listen_for_initial_heartbeat, self.logger, True, hearbeat_timeout)
+        hearbeat_timeout = self.generate_wait_time()
+        self.heartbeat_listener = MulticastListener(self.server_multicast_address, self.server_multicast_port, self.listen_for_initial_heartbeat, self.logger, True, self.hearbeat_timeout)
         self.heartbeat_listener.start()
+
+        self.logger.info("Sleeping")
+        time.sleep(self.hearbeat_timeout)
+        self.logger.info("Sleeping")
+        self.stop_uid_cast_thread.set()
+
         
             
     def become_chat_server(self):
@@ -322,6 +342,46 @@ class ChatServer:
         announce_thread.join()
         consumer_thread.join()
         heartbeat_thread.join()
+
+    def generate_wait_time( self) -> int:
+        """
+        Generates a wait time based on a unique identifier.
+
+        Parameters:
+        - min_wait (int): The minimum wait time.
+        - max_wait (int): The maximum wait time.
+        - min_delta (int): The minimum delta between servers.
+        - unique_id (str): The unique identifier for the server (UUID v4).
+
+        Returns:
+        - int: A unique wait time within the specified bounds.
+        """
+        min_wait = self.hearbeat_timeout
+        max_wait = self.election_wait_time * 1.1
+        unique_id = self.uuid
+        min_delta = self.election_wait_time /2
+
+        # Convert the unique identifier to an integer
+        int_value = uuid.UUID(str(unique_id)).int
+
+        # Apply a backoff strategy with jitter
+        wait_time = min_wait
+        while wait_time < max_wait:
+            # Add jitter to the wait time
+            jitter = random.uniform(0, min_delta)
+            wait_time_with_jitter = wait_time + jitter
+            
+            # Check if the wait time with jitter is within the max limit
+            if wait_time_with_jitter <= max_wait:
+                
+                self.logger.info(f"Generated Waittime: {wait_time_with_jitter}")
+                return round(wait_time_with_jitter)
+            
+        # Increase the wait time exponentially
+        wait_time *= 2
+    
+        self.logger.info(f"Generated Waittime: {max_wait}")
+        return max_wait
 
 if __name__ == "__main__":
     server = ChatServer()
