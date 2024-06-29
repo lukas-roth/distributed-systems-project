@@ -32,10 +32,7 @@ class MulticastListener(threading.Thread):
                 self.logger.warning(f"Socket timeout occurred - Handler: {self.handler.__name__}")
                 self.handler(e)
                 self.running = False
-            except Exception as e:
-                self.logger.error(f"Error receiving message: {e} - Handler: {self.handler.__name__}")
-                self.running = False
-    
+            
     def stop(self):
         self.logger.debug(f"Stopping MulticastListener! - Handler: {self.handler.__name__}")
         self.sock.close()
