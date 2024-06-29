@@ -1,7 +1,6 @@
 import threading
 import socket
 import struct
-import logging
 
 class MulticastListener(threading.Thread):
     def __init__(self, multicast_address, port, handler, logger, has_timeout=False, timeout=0):
@@ -27,16 +26,18 @@ class MulticastListener(threading.Thread):
             try:
                 data, addr = self.sock.recvfrom(1024*65)
                 if data:
-                    self.logger.debug(f"Received data from {addr}")
+                    self.logger.debug(f"Received data from {addr} - Handler: {self.handler.__name__}")
                     self.handler(data.decode('utf-8'))
             except socket.timeout as e:
-                self.logger.warning("Socket timeout occurred")
+                self.logger.warning(f"Socket timeout occurred - Handler: {self.handler.__name__}")
                 self.handler(e)
                 self.running = False
             except Exception as e:
-                self.logger.error(f"Error receiving message: {e}")
+                self.logger.error(f"Error receiving message: {e} - Handler: {self.handler.__name__}")
                 self.running = False
     
     def stop(self):
-        self.running = False
+        self.logger.debug(f"Stopping MulticastListener! - Handler: {self.handler.__name__}")
         self.sock.close()
+        self.running = False
+        
