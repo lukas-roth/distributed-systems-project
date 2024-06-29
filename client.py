@@ -6,6 +6,7 @@ import logging
 import logging.config
 import configparser
 import curses
+import threading
 import time
 import locale
 import json
@@ -28,7 +29,9 @@ class ChatClient:
         self.current_server = None
         self.client_id = client_id
         self.received_messages = deque(maxlen=10)
-        self.server_connection_lost = False
+        self.is_connected_to_server = False
+        self.trigger_response_event = threading.Event()
+        self.running = True
 
         # Load logging configuration with dynamic log file name
         log_filename = f'client_{self.client_id}.log'
@@ -53,25 +56,12 @@ class ChatClient:
     
     def process_messages(self, messages):
         for index, message in enumerate(messages.split('\n')):
-            username, content = message.split(':', 1)
             if (index < 10) and message not in self.received_messages: 
                 self.received_messages.append(message)
                 self.update_chat()
             
             
-                if self.message_count >= 5:
-                    response = None
-                    if random.random() < 0.55:
-                        response = self.find_new_event(messages)
-                    self.message_count = 0  
-                    if response:
-                        return response          
                 
-                if username != self.username:
-                    response = self.find_response(content)
-                    if response:
-                        return response
-        return None
     
     def draw_chat(self, stdscr):
         self.stdscr = stdscr
@@ -86,7 +76,30 @@ class ChatClient:
         
         # Draw the static part of the interface
         stdscr.addstr(0, 0, f"Chat View ({self.client_id}: {self.username})")
+        if height > 11: 
+            dash_line = '-' * width  # Create a line of dashes the width of the terminal
+            stdscr.addstr(11, 0, dash_line)
+
+        self.stdscr.addstr(12, 0, "Type:".strip())
         stdscr.refresh()
+    
+    def type_message_animation(self, message):
+        typed_msg = ""
+        username, content = message.split(':', 1)
+        for index,char in enumerate(content):
+            typed_msg = typed_msg + char
+            self.stdscr.addstr(12, index+5, char.strip())
+            self.stdscr.refresh()
+            time.sleep(.05)
+        time.sleep(.05)
+        # Move to the starting column for text
+        self.stdscr.move(12, 5)
+        # Clear to the end of the line
+        self.stdscr.clrtoeol()
+        self.stdscr.refresh()
+
+            
+
     
     def update_chat(self):
         # Initialize color pairs
@@ -135,12 +148,12 @@ class ChatClient:
         self.logger.debug(f"Selecting from the following events: {events}")
         return random.choice(events) if events else "Goal by Germany!"
 
-    def handle_server_message(self, message):
+    def handle_server_announcement_message(self, message):
         self.logger.info(f"Received message on multicast address {self.client_group_multicast_address}:{self.client_group_multicast_port} : '{message}'")
         self.message_queue.put(message)
     
     def start_multicast_listener(self):
-        listener = MulticastListener(self.client_group_multicast_address, self.client_group_multicast_port, self.handle_server_message, self.logger)
+        listener = MulticastListener(self.client_group_multicast_address, self.client_group_multicast_port, self.handle_server_announcement_message, self.logger)
         listener.start()
 
     def run(self):
@@ -154,15 +167,17 @@ class ChatClient:
         while True:
             try:
                 advertised_server = self.message_queue.get(timeout=1)  # Adjust timeout as necessary
-                
-                if (self.current_server != advertised_server or self.server_connection_lost):
+                self.logger.debug(advertised_server)
+                self.logger.debug(self.current_server)
+                self.logger.debug(self.is_connected_to_server)
+                self.logger.debug(self.current_server != advertised_server)
+                if (self.current_server != advertised_server and not self.is_connected_to_server):
                     self.current_server = advertised_server 
                     server_ip, server_port = advertised_server.split(':')
                     server_port = int(server_port)
                     # Establish socket connection here
                     time.sleep(random.randint(1, self.wait_time_before_connect))  # Wait before connecting
-                    self.connect_to_server(server_ip, server_port)
-                    
+                    self.connect_to_server(server_ip, server_port)    
             except queue.Empty:
                 # Check for user input
                 self.stdscr.nodelay(True)
@@ -170,51 +185,111 @@ class ChatClient:
                 if key == 26:  # ASCII value for Ctrl+Z
                     self.logger.info("Exiting client.")
                     break  # Exit the loop to end the program
+            
+
+    def handle_response(self):
+        
+            self.logger.debug(f'Thread started!')
+            try:
+                while self.is_connected_to_server:
+                    self.logger.debug(f'Waiting for response trigger: {self.trigger_response_event}')
+                    self.trigger_response_event.wait()
+                    self.logger.debug(f'Triggerd: {self.trigger_response_event}')
+                    response = None
+                    for message in self.received_messages:
+                        username, content = message.split(':', 1)
+                        self.logger.debug(f'Selecting, username: {username}, content {content}, message count {self.message_count}')
+                        if self.message_count >= 5:
+                            response = None
+                            if random.random() < 0.75:
+                                response = self.find_new_event(self.received_messages)
+                            self.message_count = 0  
+
+                            if response is not None:
+                                break
+                                    
+                        if username != self.username:
+                            response = self.find_response(content) 
+                            if response is not None:
+                                break
+                    self.logger.debug(f'Selected response: {response}')            
+                    if response is not None:
+                        response = f"{self.username}: {response}"
+                        time.sleep(random.randint(1, self.wait_time_before_message))
+                        self.send_message(response)
+                        self.logger.info(f"Sent response: {response}")
+                    self.trigger_response_event.clear()
+                    self.logger.debug(f'Response trigger cleared: {self.trigger_response_event}')
+            except Exception as e:
+                self.logger.error(e)
+        
+    
+    def send_message(self, message):
+        self.type_message_animation(message)
+        self.received_messages.append(message)
+        self.update_chat()
+        self.server_sock.sendto(message.encode('utf-8'), (self.server_ip, self.server_port))
 
     def connect_to_server(self, server_ip, server_port):
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            self.server_sock = sock
+            self.server_ip = server_ip
+            self.server_port = server_port
             self.logger.info(f"Connected to server at {server_ip}:{server_port}")
-            
+            self.is_connected_to_server = True
+            sock.settimeout(10)
             try:
+                if self.is_connected_to_server:
+                    # When reconnecting after lost connection
+                    self.received_messages.append("Info: Connection to server established")
+                    self.update_chat()
+                    time.sleep(1)
+
                 msg = f"{self.username}: {self.find_new_event(None)}"
-                sock.sendto(msg.encode('utf-8'), (server_ip, server_port))
+                self.send_message(msg)
                 self.logger.info(f"Sent response: {msg}")
-                
+
+                self.logger.debug(f"Starting response thread.")
+                response_handler = threading.Thread(target=self.handle_response)
+                response_handler.start()
+
                 while True:
-                    data, addr = sock.recvfrom(1024*65)
-                    if data:
-                        self.logger.debug(f"Received data from {addr, data}")
-                        chat_message = data.decode('utf-8')
-                        self.message_count += 1
+                    try:
+                        data, addr = sock.recvfrom(1024 * 65)
+                        if data:
+                            self.logger.debug(f"Received message from {addr, data}")
+                            chat_message = data.decode('utf-8')
+                            self.message_count += 1
+                            self.process_messages(chat_message)
+                            self.trigger_response_event.set()
+                            self.logger.debug(f'Trigger response: {self.trigger_response_event}')
 
-                        if self.server_connection_lost:
-                            self.received_messages.append("Info: Connection to server established")
-                            self.server_connection_lost = False
+                        # Check for user input
+                        self.stdscr.nodelay(True)
+                        key = self.stdscr.getch()
+                        if key == 26:  # ASCII value for Ctrl+Z
+                            self.logger.info("Exiting client.")
+                            exit()
 
-                        response = self.process_messages(chat_message)
-                        if response is not None:
-                            response = f"{self.username}: {response}"
-                            time.sleep(random.randint(1, self.wait_time_before_message))
-                            self.received_messages.append(response)
-                            self.update_chat()
-                            sock.sendto(response.encode('utf-8'), (server_ip, server_port))
-                            self.logger.info(f"Sent response: {response}")
-
-                    # Check for user input
-                    self.stdscr.nodelay(True)
-                    key = self.stdscr.getch()
-                    if key == 26:  # ASCII value for Ctrl+Z
-                        self.logger.info("Exiting client.")
-                        exit()
-                        
+                    except socket.timeout as e:
+                        self.logger.error(f"Socket timeout: {e}")
+                        self.is_connected_to_server = False
+                        self.server_sock = None
+                        self.received_messages.append("Warning!: Connection to server lost")
+                        self.update_chat()
+                        self.logger.debug('Done closing connection')
+                        break  # Exit the while loop if a timeout occurs
 
             except socket.error as e:
                 self.logger.error(f"Socket error: {e}")
-                self.server_connection_lost = True
+                self.is_connected_to_server = False
+                self.server_sock = None
                 self.received_messages.append("Warning!: Connection to server lost")
                 self.update_chat()
-            #except Exception as e:
-                #self.logger.error(f"An error occurred: {e}")
+                self.logger.debug('Done closing connection')
+            except Exception as e:
+                self.logger.error(f"An error occurred: {e}")
+
 
 if __name__ == "__main__":
     import sys

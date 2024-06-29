@@ -24,12 +24,12 @@ class ChatServer:
         self.heartbeat_multicast_port = config.getint('SERVER', 'HeartbeatGroupMulticastPort')
         self.uid_group_multicast_address = config.get('SERVER', 'UidGroupMulticastAddress') 
         self.uid_group_multicast_port = config.getint('SERVER', 'UidGroupMulticasPort')
-        self.server_port = 5001  
+        self.server_port = None  
         self.election_port = 5002
 
         self.clients = []
         self.message_queue = queue.Queue()
-        self.last_100_messages = deque(maxlen=20)
+        self.last_100_messages = deque(maxlen=10)
 
         self.election_msg_timeout = config.getfloat('SERVER', 'ElectionMessageTimeout')
         self.heartbeat_interval = config.getfloat('SERVER','HeartbeatInterval')
@@ -59,10 +59,11 @@ class ChatServer:
             ttl = struct.pack('b', 1)
             sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, ttl)
             while self.running:
-                message = f"{socket.gethostbyname(socket.gethostname())}:{self.server_port}"
-                sock.sendto(message.encode('utf-8'), (self.client_multicast_address, self.client_multicast_port))
-                self.logger.debug(f"Announced server at {message}")
-                time.sleep(5)  # Announce every 5 seconds
+                if self.server_port is not None:
+                    message = f"{socket.gethostbyname(socket.gethostname())}:{self.server_port}"
+                    sock.sendto(message.encode('utf-8'), (self.client_multicast_address, self.client_multicast_port))
+                    self.logger.debug(f"Announced server at {message}")
+                    time.sleep(5)  # Announce every 5 seconds
 
     def handle_client_messages(self):
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as server_sock:
@@ -344,13 +345,15 @@ class ChatServer:
         consumer_thread = threading.Thread(target=self.consume_message_queue)
         consumer_thread.start()
 
+        client_handling_thread = threading.Thread(target=self.handle_client_messages)
+        client_handling_thread.start()
+
         client_announcement_thread = threading.Thread(target=self.announce_presence)
         client_announcement_thread.start()
 
-        self.handle_client_messages()
-
         # Join threads when stopping
         client_announcement_thread.join()
+        client_handling_thread.join()
         consumer_thread.join()
         heartbeat_thread.join()
 
