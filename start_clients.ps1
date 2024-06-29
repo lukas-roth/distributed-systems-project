@@ -6,18 +6,20 @@ param (
 $envName = "ds"
 
 # Path to the client script
-$clientScript = ".\client.py"
+$clientScript = ".\client.py"  # Use the full path to the client script
 
-# Function to activate Conda environment and start a client
+# Function to start a client with resizing
 function Start-Client {
     param (
         [int]$clientId
     )
+
+    # Set environment variables for Unicode support
+    [System.Environment]::SetEnvironmentVariable("PYTHONIOENCODING", "utf-8", "Process")
+    [System.Environment]::SetEnvironmentVariable("PYTHONUTF8", 1, "Process")
     
-    # Construct the command to activate Conda environment and start the client
-    $command = "conda activate $envName; python $clientScript client$clientId"
-    
-    # Start the client in a new process
+    # Start the client in a new process with resizing
+    $command = "powershell -NoExit -File .\resize.ps1 -width 80 -height 13 -envName `"$envName`" -clientScript `"$clientScript`" -clientId $clientId"
     Start-Process powershell -ArgumentList "-NoExit", "-Command", $command
 }
 
